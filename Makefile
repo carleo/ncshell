@@ -1,5 +1,5 @@
 CC := gcc
-LDFLAGS := -lutil -lpthread
+LDFLAGS := -lutil
 
 TARGET := ncshell
 
