@@ -211,7 +211,7 @@ int main(int argc, char **argv)
               settings.target, hstrerror(h_errno));
       exit(1);
     }
-    memcpy(*(hp->h_addr_list), &sock_addr.sin_addr, sizeof(struct in_addr));
+    memcpy(&sock_addr.sin_addr, *(hp->h_addr_list), sizeof(struct in_addr));
     if (connect(sock_fd, (struct sockaddr*)&sock_addr,
                 sizeof(struct sockaddr_in)) == -1) {
       fprintf(stderr, "can not connect to target: %s\n",
