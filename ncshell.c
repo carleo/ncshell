@@ -28,6 +28,7 @@
 #include <termios.h>
 #include <signal.h>
 #include <pwd.h>
+#include <setjmp.h>
 
 #define BUFLEN 1024
 
@@ -45,19 +46,22 @@ struct _settings {
   char *username; /* username */
 };
 
-extern int errno;
 extern char *optarg;
 extern int h_errno;
 struct _settings settings;
-struct termios oldterm;
-volatile int peer_closed = 0;
+volatile sig_atomic_t canjump = 0;
+jmp_buf jbuf;
 
 void showusage(void);
 void setting_init(void);
 void loop(int work_fd, int read_fd, int write_fd);
+
 void handler(int signum)
 {
-  exit(0);
+  if (canjump) {
+    canjump = 0;
+    longjmp(jbuf, 1);
+  }
 }
 
 void * recv_thread(void*args);
@@ -69,6 +73,7 @@ int main(int argc, char **argv)
   int sock_fd, work_fd;
   int read_fd, write_fd;
   struct passwd *pw;
+  struct termios oldterm;
 
   while (-1 != (c = getopt(argc, argv, "hlp:st:u:w"))) {
     switch (c) {
@@ -303,7 +308,11 @@ int main(int argc, char **argv)
   }
 
   signal(SIGPIPE, SIG_IGN);
-  loop(work_fd, read_fd, write_fd);
+
+  if (setjmp(jbuf) == 0) {
+    canjump = 1;
+    loop(work_fd, read_fd, write_fd);
+  }
 
   shutdown(work_fd, SHUT_RDWR);
   close(work_fd);

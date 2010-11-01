@@ -6,7 +6,7 @@ TARGET := ncshell
 all: $(TARGET)
 
 $(TARGET): ncshell.c
-	$(CC) -o $@ $< $(LDFLAGS)
+	$(CC) -g -o $@ $< $(LDFLAGS)
 
 clean:
 	-@rm -f $(TARGET)
