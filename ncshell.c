@@ -11,6 +11,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <sys/ioctl.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -20,10 +21,14 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <errno.h>
-#include <malloc.h>
 #include <fcntl.h>
 #include <pthread.h>
+#if defined(__APPLE__) || defined(__FreeBSD__)
+#include <util.h>
+#elif !defined(NO_PTY)
 #include <pty.h>
+#else
+#endif
 #include <poll.h>
 #include <termios.h>
 #include <signal.h>
@@ -58,11 +63,20 @@ void loop(int work_fd, int read_fd, int write_fd);
 
 void handler(int signum)
 {
-  if (canjump) {
-    canjump = 0;
-    longjmp(jbuf, 1);
+  if (signum == SIGCHLD) {
+    if (canjump) {
+      canjump = 0;
+      longjmp(jbuf, 1);
+    }
   }
 }
+
+
+#if defined(NO_PTY)
+int
+my_forkpty (int *amaster, char *name, const struct termios *termp,
+            const struct winsize *winp);
+#endif
 
 void * recv_thread(void*args);
 
@@ -261,15 +275,28 @@ int main(int argc, char **argv)
     struct termios term;
     struct winsize win;
     int fdm;
+    char *pname;
 
     signal(SIGCHLD, handler);
 
     /* start shell */
+#if defined(NO_PTY)
+    pid_sh = my_forkpty(&fdm, NULL, NULL, NULL);
+#else
     pid_sh = forkpty(&fdm, NULL, NULL, NULL);
+#endif
     if (pid_sh == 0) {
       char* args[] = { "bash", NULL};
+      char *pro = "/bin/bash";
+      if (access(pro, F_OK | X_OK) < 0) {
+        pro = "/system/bin/sh";
+        if (access(pro, F_OK | X_OK) < 0) {
+          fprintf(stderr, "can not find bash or sh\n");
+          exit(1);
+        }
+      }
       printf("Welcome to ncshell (pid: %d)\n", getpid());
-      if (execv("/bin/bash", args) == -1) {
+      if (execv(pro, args) == -1) {
         fprintf(stderr, "execv failed: %s\n", strerror(errno));
         exit(1);
       }
@@ -302,7 +329,6 @@ int main(int argc, char **argv)
         exit(1);
       }
     }
-    
     read_fd = STDIN_FILENO;
     write_fd = STDOUT_FILENO;
   }
@@ -348,31 +374,49 @@ ssize_t writen(int fd, void *buf, size_t size)
   }
   return 0;
 }
-  
+
 void loop(int work_fd, int read_fd, int write_fd)
 {
   struct pollfd fds[2];
   char buf[BUFLEN];
   ssize_t size;
+  int n;
+  struct winsize ws;
 
   fds[0].fd = work_fd;
   fds[0].events = POLLIN;
   fds[1].fd = read_fd;
   fds[1].events = POLLIN;
-  while (poll(fds, 2, -1) > 0) {
+  while (1) {
+    n = poll(fds, 2, -1);
+    if (n == 0) {
+      continue;
+    } else if (n < 0) {
+      if (errno == EAGAIN || errno == EINTR) {
+        continue;
+      }
+      break;
+    }
+
     if (fds[0].revents & POLLIN) {
       size = read(work_fd, buf, BUFLEN);
-      if (size <= 0)
+      if (size == 0) {
         break;
-      else if (writen(write_fd, buf, size))
+      } else if (size < 0) {
+        fprintf(stderr, "read workfd fail: %s\n", strerror(errno));
         break;
+      } else if (writen(write_fd, buf, size)) {
+        break;
+      }
     }
     if (fds[1].revents & POLLIN) {
       size = read(read_fd, buf, BUFLEN);
-      if (size <= 0)
+      if (size <= 0) {
+        fprintf(stderr, "read local fd fail: %s\n", strerror(errno));
         break;
-      else if (writen(work_fd, buf, size))
+      } else if (writen(work_fd, buf, size)) {
         break;
+      }
     }
   }
 }
@@ -383,10 +427,10 @@ void showusage(void)
   printf("%s",
          "-h         print this help and exit\n"
          "-l         listen to port (server mode), default: off\n"
-         "-p <port>   TCP port to connect or listen to\n"
+         "-p <port>  TCP port to connect or listen to\n"
          "-t <host>  target host to connect\n"
          "-s         start a shell, default: off\n"
-         "-u <user>  run as user"
+         "-u <user>  run as user\n"
          "-w         waiting for connection, default: off\n"
          );
 }
@@ -399,3 +443,178 @@ void setting_init(void)
   settings.target = NULL;
   settings.shell = 0;
 }
+
+
+#if defined(NO_PTY)
+
+int
+my_login_tty(fd)
+	int fd;
+{
+	(void) setsid();
+#ifdef TIOCSCTTY
+	if (ioctl(fd, TIOCSCTTY, (char *)NULL) == -1)
+		return (-1);
+#else
+	{
+	  /* This might work.  */
+	  char *fdname = ttyname (fd);
+	  int newfd;
+	  if (fdname)
+	    {
+	      if (fd != 0)
+		(void) close (0);
+	      if (fd != 1)
+		(void) close (1);
+	      if (fd != 2)
+		(void) close (2);
+	      newfd = open (fdname, O_RDWR);
+	      (void) close (newfd);
+	    }
+	}
+#endif
+	while (dup2(fd, 0) == -1 && errno == EBUSY)
+	  ;
+	while (dup2(fd, 1) == -1 && errno == EBUSY)
+	  ;
+	while (dup2(fd, 2) == -1 && errno == EBUSY)
+	  ;
+	if (fd > 2)
+		(void) close(fd);
+	return (0);
+}
+
+static int
+pts_name (int fd, char **pts, size_t buf_len)
+{
+  int rv;
+  char *buf = *pts;
+
+  for (;;)
+    {
+      char *new_buf;
+
+      if (buf_len)
+	{
+	  rv = ptsname_r (fd, buf, buf_len);
+
+	  if (rv != 0 || memchr (buf, '\0', buf_len))
+	    /* We either got an error, or we succeeded and the
+	       returned name fit in the buffer.  */
+	    break;
+
+	  /* Try again with a longer buffer.  */
+	  buf_len += buf_len;	/* Double it */
+	}
+      else
+	/* No initial buffer; start out by mallocing one.  */
+	buf_len = 128;		/* First time guess.  */
+
+      if (buf != *pts)
+	/* We've already malloced another buffer at least once.  */
+	new_buf = realloc (buf, buf_len);
+      else
+	new_buf = malloc (buf_len);
+      if (! new_buf)
+	{
+	  rv = -1;
+	  __set_errno (ENOMEM);
+	  break;
+	}
+      buf = new_buf;
+    }
+
+  if (rv == 0)
+    *pts = buf;		/* Return buffer to the user.  */
+  else if (buf != *pts)
+    free (buf);		/* Free what we malloced when returning an error.  */
+
+  return rv;
+}
+
+int my_openpty (int *amaster, int *aslave, char *name,
+	 const struct termios *termp, const struct winsize *winp)
+{
+#ifdef PATH_MAX
+  char _buf[PATH_MAX];
+#else
+  char _buf[512];
+#endif
+  char *buf = _buf;
+  int master, slave;
+
+  master = getpt ();
+  if (master == -1)
+    return -1;
+
+  if (grantpt (master))
+    goto fail;
+
+  if (unlockpt (master))
+    goto fail;
+
+  if (pts_name (master, &buf, sizeof (_buf)))
+    goto fail;
+
+  slave = open (buf, O_RDWR | O_NOCTTY);
+  if (slave == -1)
+    {
+      if (buf != _buf)
+	free (buf);
+
+      goto fail;
+    }
+
+  /* XXX Should we ignore errors here?  */
+  if(termp)
+    tcsetattr (slave, TCSAFLUSH, termp);
+  if (winp)
+    ioctl (slave, TIOCSWINSZ, winp);
+
+  *amaster = master;
+  *aslave = slave;
+  if (name != NULL)
+    strcpy (name, buf);
+
+  if (buf != _buf)
+    free (buf);
+  return 0;
+
+ fail:
+  close (master);
+  return -1;
+}
+
+
+int
+my_forkpty (int *amaster, char *name, const struct termios *termp,
+         const struct winsize *winp)
+{
+  int master, slave, pid;
+
+  if (my_openpty (&master, &slave, name, termp, winp) == -1)
+    return -1;
+
+  switch (pid = fork ())
+    {
+    case -1:
+      close (master);
+      close (slave);
+      return -1;
+    case 0:
+      /* Child.  */
+      close (master);
+      if (my_login_tty (slave))
+	_exit (1);
+
+      return 0;
+    default:
+      /* Parent.  */
+      *amaster = master;
+      close (slave);
+
+      return pid;
+    }
+}
+
+#endif
