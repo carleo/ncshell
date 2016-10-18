@@ -71,6 +71,22 @@ void handler(int signum)
   }
 }
 
+void show_winsize()
+{
+    struct winsize ws;
+    if (ioctl(0, TIOCGWINSZ, &ws) == -1) {
+        perror("ioctl TIOCGWINSZ");
+    } else {
+        fprintf(stderr, ">> winsize: %d x %d\n", ws.ws_row, ws.ws_col);
+    }
+}
+
+void win_handler(int signum)
+{
+    signal(SIGWINCH, SIG_IGN);
+    show_winsize();
+    signal(SIGWINCH, win_handler);
+}
 
 #if defined(NO_PTY)
 int
@@ -88,6 +104,12 @@ int main(int argc, char **argv)
   int read_fd, write_fd;
   struct passwd *pw;
   struct termios oldterm;
+  char shake_data[10];
+  char shake_buf[10];
+  uint32_t value;
+  size_t shake_size;
+  ssize_t io_len;
+  struct winsize ws;
 
   while (-1 != (c = getopt(argc, argv, "hlp:st:u:w"))) {
     switch (c) {
@@ -146,7 +168,7 @@ int main(int argc, char **argv)
       exit(1);
     }
   }
-  
+
   sock_fd = -1;
   work_fd = -1;
   memset((void *)&sock_addr, 0, sizeof(struct sockaddr_in));
@@ -199,6 +221,27 @@ int main(int argc, char **argv)
 
   }
 
+  // prepare shake data
+  shake_size = 6;
+  shake_data[0] = 'n';
+  shake_data[1] = 'c';
+  shake_data[2] = 's';
+  shake_data[3] = 'h';
+  shake_data[4] = 0x1;
+  shake_data[5] = 0x0;
+  if (!settings.shell) {
+    if (ioctl(0, TIOCGWINSZ, &ws) > -1) {
+      if (ws.ws_row <= 65535 && ws.ws_col <= 65535) {
+        shake_size = 10;
+        shake_data[5] = 0x1;
+        *((uint16_t *)(shake_data + 6)) = htons((uint16_t) ws.ws_row);
+        *((uint16_t *)(shake_data + 8)) = htons((uint16_t) ws.ws_col);
+        fprintf(stderr, ">> to send win size: %d x %d\n", ws.ws_row, ws.ws_col);
+        // fprintf(stderr, ">> real data: %hu %hu\n", *((uint16_t*)(shake_data + 6)), *((uint16_t*)(shake_data + 8)));
+      }
+    }
+  }
+
   if (settings.listen) {
     char clientip[20];
     socklen_t al;
@@ -233,8 +276,50 @@ int main(int argc, char **argv)
       exit(1);
     }
     printf("connected\n");
+    // hand shake
+    io_len = write(sock_fd, shake_data, shake_size);
+    if (io_len != shake_size) {
+      fprintf(stderr, "can not send shake packet\n");
+      exit(1);
+    }
+    fprintf(stderr, ">> send shake (bytes: %zd)\n", io_len);
     work_fd = sock_fd;
   }
+
+  // minimum shake size 6
+  io_len = read(work_fd, shake_buf, 6);
+  if (io_len != 6) {
+    if (io_len == -1) {
+      perror("can not receive shake");
+    } else {
+      fprintf(stderr, "can not receive full shake packet (got: %zd)\n", io_len);
+    }
+    exit(1);
+  }
+  if (strncmp(shake_data, shake_buf, 5)) {
+    fprintf(stderr, "receive bad shake packet\n");
+    exit(1);
+  }
+  ws.ws_row = 0;
+  ws.ws_col = 0;
+  // optional win size: 4 bytes
+  if (shake_buf[5] & 0x1) {
+    if (read(work_fd, shake_buf + 6, 4) != 4) {
+      fprintf(stderr, "can not receive extra winsize\n");
+      exit(1);
+    }
+    ws.ws_row = ntohs(*((uint16_t *)(shake_buf + 6)));
+    ws.ws_col = ntohs(*((uint16_t *)(shake_buf + 8)));
+    fprintf(stderr, ">> win size: %d x %d\n", ws.ws_row, ws.ws_col);
+  }
+
+  if (settings.listen) {
+    if (write(work_fd, shake_data, shake_size) != shake_size) {
+      fprintf(stderr, "can not send back shake packet\n");
+      exit(1);
+    }
+  }
+  fprintf(stderr, ">> shake done\n");
 
   /* run as daemon by default if we are going to start shell */
   if (settings.shell && !settings.wait) {
@@ -273,17 +358,19 @@ int main(int argc, char **argv)
   if (settings.shell) {
     pid_t pid_sh;
     struct termios term;
-    struct winsize win;
+    struct winsize *winp = NULL;
     int fdm;
     char *pname;
 
     signal(SIGCHLD, handler);
-
+    if (ws.ws_row > 0 && ws.ws_col > 0) {
+      winp = &ws;
+    }
     /* start shell */
 #if defined(NO_PTY)
-    pid_sh = my_forkpty(&fdm, NULL, NULL, NULL);
+    pid_sh = my_forkpty(&fdm, NULL, NULL, winp);
 #else
-    pid_sh = forkpty(&fdm, NULL, NULL, NULL);
+    pid_sh = forkpty(&fdm, NULL, NULL, winp);
 #endif
     if (pid_sh == 0) {
       char* args[] = { "bash", NULL};
@@ -331,6 +418,8 @@ int main(int argc, char **argv)
     }
     read_fd = STDIN_FILENO;
     write_fd = STDOUT_FILENO;
+
+    signal(SIGWINCH, win_handler);
   }
 
   signal(SIGPIPE, SIG_IGN);
@@ -381,7 +470,6 @@ void loop(int work_fd, int read_fd, int write_fd)
   char buf[BUFLEN];
   ssize_t size;
   int n;
-  struct winsize ws;
 
   fds[0].fd = work_fd;
   fds[0].events = POLLIN;
@@ -412,7 +500,9 @@ void loop(int work_fd, int read_fd, int write_fd)
     if (fds[1].revents & POLLIN) {
       size = read(read_fd, buf, BUFLEN);
       if (size <= 0) {
-        fprintf(stderr, "read local fd fail: %s\n", strerror(errno));
+        if (size < 0) {
+          fprintf(stderr, "read local fd fail: %s\n", strerror(errno));
+        }
         break;
       } else if (writen(work_fd, buf, size)) {
         break;
